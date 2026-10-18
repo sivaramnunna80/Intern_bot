@@ -37,10 +37,21 @@ def fetch_json(url):
         return json.loads(response.read().decode("utf-8"))
 
 
+
 def clean(value):
-    value = re.sub(r"<[^>]+>", " ", value or "")
+    if value is None:
+        return ""
+
+    # Some job APIs return lists instead of strings.
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value if item is not None)
+    elif not isinstance(value, str):
+        value = str(value)
+
+    value = re.sub(r"<[^>]+>", " ", value)
     value = html.unescape(value)
     return re.sub(r"\s+", " ", value).strip()
+
 
 
 def normalize(source, job):
