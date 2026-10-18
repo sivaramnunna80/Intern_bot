@@ -1,3 +1,195 @@
+import os
+import json
+import re
+import html
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from urllib.request import Request, urlopen
+
+# Active for one year: 18 Oct 2026 through 17 Oct 2027.
+START_DATE = date(2026, 10, 18)
+END_DATE = date(2027, 10, 18)  # Alerts stop on this date.
+MAX_DAILY_ALERTS = 15
+SEEN_FILE = "seen_jobs.json"
+
+# Match relevant internship titles, plus related skills in descriptions.
+ROLE_TERMS = [
+    "machine learning", "artificial intelligence", "ai intern", "ml intern",
+    "data science", "data scientist intern", "deep learning",
+    "natural language processing", "nlp intern", "computer vision",
+    "generative ai", "llm intern", "python intern", "research intern",
+    "software engineer intern", "software developer intern"
+]
+SKILLS = [
+    "python", "machine learning", "deep learning",
+    "artificial intelligence", "natural language processing", "nlp",
+    "pytorch", "tensorflow", "scikit-learn", "pandas", "numpy",
+    "computer vision", "generative ai", "large language model", "llm",
+    "data science", "data analysis", "neural network"
+]
+AI_TERMS = [
+    "machine learning", "artificial intelligence", "deep learning",
+    "natural language processing", "computer vision", "data science",
+    "generative ai", "large language model", "neural network",
+    "pytorch", "tensorflow", "scikit-learn", "nlp"
+]
+
+
+def fetch_json(url):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "PersonalInternshipAlert/1.0",
+            "Accept": "application/json"
+        }
+    )
+    with urlopen(request, timeout=25) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def clean(value):
+    """Convert API fields of different types to safe plain text."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value if item is not None)
+    elif isinstance(value, dict):
+        value = " ".join(str(item) for item in value.values() if item is not None)
+    elif not isinstance(value, str):
+        value = str(value)
+
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html.unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize(source, job):
+    """Convert different public job-feed formats into one format."""
+    if source == "Remotive":
+        return {
+            "id": str(job.get("id") or job.get("url") or ""),
+            "title": clean(job.get("title")),
+            "company": clean(job.get("company_name")),
+            "location": clean(job.get("candidate_required_location") or "Remote"),
+            "description": clean(job.get("description")),
+            "url": clean(job.get("url")),
+            "type": clean(job.get("job_type")),
+            "remote": True
+        }
+
+    if source == "Jobicy":
+        return {
+            "id": str(job.get("id") or job.get("url") or ""),
+            "title": clean(job.get("jobTitle")),
+            "company": clean(job.get("companyName")),
+            "location": clean(job.get("jobGeo") or "Remote"),
+            "description": clean(job.get("jobDescription")),
+            "url": clean(job.get("url")),
+            "type": clean(job.get("jobType")),
+            "remote": True
+        }
+
+    if source == "Arbeitnow":
+        return {
+            "id": str(job.get("slug") or job.get("url") or ""),
+            "title": clean(job.get("title")),
+            "company": clean(job.get("company_name")),
+            "location": clean(job.get("location")),
+            "description": clean(job.get("description")),
+            "url": clean(job.get("url")),
+            "type": clean(job.get("job_types")),
+            "remote": bool(job.get("remote", False))
+        }
+
+    return {}
+
+
+def get_sources():
+    results = []
+
+    sources = [
+        ("Remotive", "https://remotive.com/api/remote-jobs", "jobs"),
+        ("Jobicy", "https://jobicy.com/api/v2/remote-jobs?count=200", "jobs"),
+        ("Arbeitnow", "https://www.arbeitnow.com/api/job-board-api", "data")
+    ]
+
+    for source, url, list_key in sources:
+        try:
+            data = fetch_json(url)
+            jobs = data.get(list_key, [])
+            if not isinstance(jobs, list):
+                print(f"{source}: unexpected API response format")
+                continue
+            for job in jobs:
+                if isinstance(job, dict):
+                    normalized = normalize(source, job)
+                    if normalized:
+                        results.append((source, normalized))
+            print(f"{source}: {len(jobs)} listings")
+        except Exception as error:
+            print(f"{source} unavailable: {error}")
+
+    print("Adzuna skipped: optional API credentials are not configured.")
+    return results
+
+
+def is_internship(job):
+    title = clean(job.get("title")).lower()
+    job_type = clean(job.get("type")).lower()
+    return (
+        "intern" in title
+        or "internship" in title
+        or "intern" in job_type
+        or "internship" in job_type
+    )
+
+
+def is_ai_role(job):
+    title = clean(job.get("title")).lower()
+    description = clean(job.get("description")).lower()
+    # A clear relevant title is sufficient; otherwise require AI-related
+    # terms in the description to reduce irrelevant results.
+    if any(term in title for term in ROLE_TERMS):
+        return True
+    return any(term in f"{title} {description}" for term in AI_TERMS)
+
+
+def location_matches(job):
+    location = clean(job.get("location")).lower()
+    source = job.get("source", "")
+
+    india_terms = ["india", "bengaluru", "bangalore", "hyderabad",
+                   "chennai", "mumbai", "pune", "delhi", "noida",
+                   "gurugram", "gurgaon", "kolkata"]
+    remote_terms = ["remote", "worldwide", "anywhere", "all countries",
+                    "asia", "apac"]
+
+    if source in ("Remotive", "Jobicy"):
+        # These are remote-job feeds. The listing still needs to match
+        # the internship and AI/ML filters above.
+        return True
+
+    if job.get("remote", False):
+        return True
+
+    return any(term in location for term in india_terms + remote_terms)
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as file:
+            data = json.load(file)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_seen(seen):
+    with open(SEEN_FILE, "w", encoding="utf-8") as file:
+        json.dump(seen, file, indent=2, ensure_ascii=False)
+
+
+def send_telegram(message):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
